@@ -2,3 +2,7 @@ You know, i have an update roadmap.
 1.0 is the original, with some more features coming along,
 
 i plan to add a fibonnaci sequence and some more advanced stuff in later versions.
+Today i publish a small patch for now to show what is to come, there will be more soon enough, but you will like it.
+This patch changelog brings:
+1. Fibonacci Sequence
+2. some fixes and stuff
