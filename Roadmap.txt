@@ -1,0 +1,4 @@
+You know, i have an update roadmap.
+1.0 is the original, with some more features coming along,
+
+i plan to add a fibonnaci sequence and some more advanced stuff in later versions.
