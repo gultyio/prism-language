@@ -4,9 +4,44 @@ import re
 import os
 import sys
 
+PREBUILT_LIBRARY_NAMES = {"wc": "WC", "bitwin": "Bitwin"}
+
+
+def get_library_directory():
+    app_data = os.environ.get("APPDATA", os.path.expanduser("~"))
+    return os.path.join(app_data, "Prism", "libraries")
+
+
+def install_library(name):
+    canonical_name = PREBUILT_LIBRARY_NAMES.get(name.lower())
+    if canonical_name is None:
+        raise ValueError(
+            f"Unknown library '{name}'. Available libraries: WC, Bitwin."
+        )
+
+    bundle_directory = getattr(
+        sys,
+        "_MEIPASS",
+        os.path.dirname(os.path.abspath(__file__))
+    )
+    source_path = os.path.join(bundle_directory, "libraries", f"{canonical_name}.prism")
+    if not os.path.isfile(source_path):
+        raise FileNotFoundError(f"Prebuilt library package not found: {source_path}")
+
+    install_directory = get_library_directory()
+    os.makedirs(install_directory, exist_ok=True)
+    destination_path = os.path.join(install_directory, f"{canonical_name}.prism")
+    with open(source_path, "r", encoding="utf-8") as package:
+        package_contents = package.read()
+    with open(destination_path, "w", encoding="utf-8") as package:
+        package.write(package_contents)
+    return destination_path
+
+
 class PrismInterpreter:
     def __init__(self, root_tk, output_callback, settings_provider):
         self.root_tk = root_tk
+        self.owns_root_tk = False
         self.output_callback = output_callback
         self.settings_provider = settings_provider # Access IDE settings (e.g. show_comments)
         self.variables = {}
@@ -15,6 +50,7 @@ class PrismInterpreter:
         self.key_functions = {}
         self.windows = {} # Stores active GUI windows & canvases
         self.persistent_store = {} # Simulates database store
+        self.loaded_libraries = set()
 
     def log(self, text):
         self.output_callback(text + "\n")
@@ -24,7 +60,27 @@ class PrismInterpreter:
             # Create a hidden root window for CLI GUI operations if needed
             self.root_tk = tk.Tk()
             self.root_tk.withdraw()
+            self.owns_root_tk = True
         return self.root_tk
+
+    def create_toplevel(self, parent):
+        window = tk.Toplevel(parent)
+        if self.owns_root_tk:
+            window.bind("<Destroy>", self.close_cli_root_when_last_window_closes, add="+")
+        return window
+
+    def close_cli_root_when_last_window_closes(self, event):
+        if self.root_tk is None:
+            return
+
+        for window_data in self.windows.values():
+            try:
+                if window_data["window"].winfo_exists():
+                    return
+            except tk.TclError:
+                continue
+
+        self.root_tk.after_idle(self.root_tk.destroy)
 
     def run(self, code):
         self.variables.clear()
@@ -32,6 +88,7 @@ class PrismInterpreter:
         self.classes.clear()
         self.key_functions.clear()
         self.persistent_store.clear()
+        self.loaded_libraries.clear()
         
         # Close any lingering windows from previous runs
         for w_data in self.windows.values():
@@ -61,8 +118,81 @@ class PrismInterpreter:
                         self.log(f"[Comment]: {cmt_text}")
                 i += 1
                 continue
-            
-            # 2. Class Definition: c.create.new.type((class); ("class_name")); {
+
+            # 2. Installed prebuilt libraries: library.use;[WC|Bitwin]
+            elif line.lower().startswith("library.use;"):
+                match = re.fullmatch(r'library\.use;\[(.*?)\]', line, re.IGNORECASE)
+                if not match:
+                    raise ValueError("Invalid library syntax. Use library.use;[WC] or library.use;[Bitwin].")
+                requested_name = match.group(1)
+                library_name = PREBUILT_LIBRARY_NAMES.get(requested_name.lower())
+                if library_name is None:
+                    raise ValueError(f"Unknown library '{requested_name}'. Available libraries: WC, Bitwin.")
+                package_path = os.path.join(get_library_directory(), f"{library_name}.prism")
+                if not os.path.isfile(package_path):
+                    raise FileNotFoundError(
+                        f"Library '{library_name}' is not installed. Run 'prism install {library_name}' first."
+                    )
+                self.loaded_libraries.add(library_name)
+                self.log(f"Library loaded: {library_name}")
+
+            # Bitwin runs UTF-8 Prism source encoded as hexadecimal.
+            elif line.lower().startswith("bitwin.run;"):
+                if "Bitwin" not in self.loaded_libraries:
+                    raise RuntimeError("Bitwin is not loaded. Add library.use;[Bitwin] before using it.")
+                match = re.fullmatch(r'bitwin\.run;\[(.*?)\]', line, re.IGNORECASE)
+                if not match:
+                    raise ValueError("Invalid Bitwin syntax. Use bitwin.run;[hex_encoded_prism_source].")
+                hex_source = match.group(1)
+                if not hex_source or len(hex_source) % 2 or not re.fullmatch(r'[0-9a-fA-F]+', hex_source):
+                    raise ValueError("Bitwin input must be a non-empty, even-length hexadecimal string.")
+                try:
+                    decoded_source = bytes.fromhex(hex_source).decode("utf-8")
+                except UnicodeDecodeError as error:
+                    raise ValueError("Bitwin hex must decode to valid UTF-8 Prism source.") from error
+                self.execute_block(decoded_source.splitlines())
+
+            # Window Customization (WC) operations.
+            elif line.lower().startswith("wc.window."):
+                if "WC" not in self.loaded_libraries:
+                    raise RuntimeError("WC is not loaded. Add library.use;[WC] before using it.")
+                match = re.fullmatch(
+                    r'wc\.window\.(title|background|size);\s*\((.*?)\);\s*\((.*?)\)(?:;\s*\((.*?)\))?',
+                    line,
+                    re.IGNORECASE
+                )
+                if not match:
+                    raise ValueError(
+                        'Invalid WC syntax. Use wc.window.title;(Window);("Title"), '
+                        'wc.window.background;(Window);(#RRGGBB), or '
+                        'wc.window.size;(Window);(width);(height).'
+                    )
+                operation, window_name, first_value, second_value = match.groups()
+                window_name = window_name.strip().strip('"\'')
+                if window_name not in self.windows:
+                    raise ValueError(f"WC window '{window_name}' does not exist.")
+                window_data = self.windows[window_name]
+                if operation.lower() == "title":
+                    window_data["window"].title(first_value.strip().strip('"\''))
+                elif operation.lower() == "background":
+                    color = first_value.strip().strip('"\'')
+                    if not re.fullmatch(r'#[0-9a-fA-F]{6}', color):
+                        raise ValueError("WC background color must be a six-digit hex color such as #336699.")
+                    window_data["window"].configure(bg=color)
+                    window_data["canvas"].configure(bg=color)
+                else:
+                    if second_value is None:
+                        raise ValueError("WC window size requires both width and height.")
+                    try:
+                        width = int(first_value.strip())
+                        height = int(second_value.strip())
+                    except ValueError as error:
+                        raise ValueError("WC window size must use positive integer dimensions.") from error
+                    if width <= 0 or height <= 0:
+                        raise ValueError("WC window size must use positive integer dimensions.")
+                    window_data["window"].geometry(f"{width}x{height}")
+
+            # 3. Class Definition: c.create.new.type((class); ("class_name")); {
             elif line.startswith("c.create.new.type("):
                 match = re.search(r'c\.create\.new\.type\(\(class\);\s*\([\"\']?(.*?)[\"\']?\);\s*\{?', line)
                 if match:
@@ -177,7 +307,7 @@ class PrismInterpreter:
                     w_name = match[3].strip()
                     try:
                         r = self.get_root_tk()
-                        win = tk.Toplevel(r)
+                        win = self.create_toplevel(r)
                         win.title(w_name)
                         win.geometry(f"{width}x{height}")
                         win.configure(bg="#ffffff")
@@ -204,7 +334,7 @@ class PrismInterpreter:
                     
                     if w_name not in self.windows:
                         r = self.get_root_tk()
-                        win = tk.Toplevel(r)
+                        win = self.create_toplevel(r)
                         win.title(w_name)
                         win.geometry("500x400")
                         win.configure(bg="#ffffff")
@@ -633,7 +763,7 @@ class PrismInterpreter:
         w_name = "3D_Viewport"
         if w_name not in self.windows:
             root = self.get_root_tk()
-            win = tk.Toplevel(root)
+            win = self.create_toplevel(root)
             win.title("Prism 3D Viewport")
             win.geometry("900x700")
             win.configure(bg="#1e1e1e")
@@ -1376,13 +1506,29 @@ find.store.[PlayerEntity]; run
         guide_content = """--- PRISM LANGUAGE COMPLETE SYNTAX GUIDE ---
 
 1. COMMAND LINE EXECUTION (CLI):
-   Run any standalone .prism file from your terminal like this:
-   > python prism_ide.py script.prism
+   Run a Prism file from the Prism folder (or with prism on PATH):
+   > prism script.prism
+   Install a prebuilt library:
+   > prism install WC
+   > prism install Bitwin
 
-2. STANDALONE COMPILER:
+2. PREBUILT LIBRARIES:
+   Install libraries with "prism install WC" or "prism install Bitwin", then
+   load them in a script with library.use;[WC] or library.use;[Bitwin].
+
+   WC (Window Customization):
+   wc.window.title;(MyWindow);("Custom title")
+   wc.window.background;(MyWindow);(#336699)
+   wc.window.size;(MyWindow);(800);(600)
+
+   Bitwin runs UTF-8 Prism source encoded as hexadecimal:
+   bitwin.run;[682e7072696e746c696e653b2248656c6c6f22]
+   (The hex must be an even-length sequence of valid hexadecimal digits.)
+
+3. STANDALONE COMPILER:
    Click "⚙ Compile / Export" on the IDE toolbar to package your script into a standalone runnable .prism file!
 
-3. CUSTOM CLASSES & STORE EXECUTION:
+4. CUSTOM CLASSES & STORE EXECUTION:
    Syntax:
    c.create.new.type((class); ("class_name")); {
         (your code here, must have indentation)
@@ -1392,24 +1538,24 @@ find.store.[PlayerEntity]; run
    Execute Class:
    find.store.[class_name]; run
 
-4. DATABASE STORE & SCANNING:
+5. DATABASE STORE & SCANNING:
    Scan Store: scan.store (prints all stored items, classes, and variables to console)
    Store item: store.[name]
    Delete item: find.store.[name]; del
 
-5. COMPLEX MATH:
+6. COMPLEX MATH:
     Fibonacci sequence: maths.h.complexfunc.FIBONACCI; (0, 1); (10);
     The last group is the number of terms to generate. The starting pair can also
     be given in separate groups, for example: (0); (1); (10).
 
-6. 3D RAYCAST SHAPES:
+7. 3D RAYCAST SHAPES:
    Syntax: 3D.raycast.shapes; (columns x rows); (shape_type);
    Example: 3D.raycast.shapes; (16x16); (cube);
    Grid dimensions must each be from 1 to 32. Supported shapes are cube, sphere,
    cylinder, and pyramid. Click a shape in the 3D viewport to select it; the
    selected shape name is stored in [raycast_hit] and reported in the console.
 
-7. WOLFENSTEIN-STYLE RAYCAST MAPS:
+8. WOLFENSTEIN-STYLE RAYCAST MAPS:
    Syntax: 3D.raycast.wolfensteinformula.shapes; (pattern); (columns x rows);
    Example: 3D.raycast.wolfensteinformula.shapes; (101100); (16x16);
    The pattern is repeated to fill the grid (cols*rows). Characters '1' (or c/w)
@@ -1429,32 +1575,64 @@ find.store.[PlayerEntity]; run
             self.write_output(f"\n[Runtime Error]: {str(e)}\n")
 
 
+def run_cli(arguments):
+    if not arguments:
+        return None
+
+    if arguments[0] in ("--help", "-h"):
+        print("Usage: prism <script.prism> | pr-install <WC|Bitwin>")
+        return 0
+
+    if arguments[0].lower() in ("pr-install", "install"):
+        if len(arguments) != 2:
+            print("Usage: pr-install <WC|Bitwin>", file=sys.stderr)
+            return 2
+        try:
+            installed_path = install_library(arguments[1])
+            print(f"Installed {PREBUILT_LIBRARY_NAMES[arguments[1].lower()]} to {installed_path}")
+            return 0
+        except (OSError, ValueError) as error:
+            print(f"Prism library install error: {error}", file=sys.stderr)
+            return 1
+
+    if len(arguments) != 1:
+        print("Usage: prism <script.prism> | pr-install <WC|Bitwin>", file=sys.stderr)
+        return 2
+
+    target_file = arguments[0]
+    if not os.path.isfile(target_file):
+        print(f"Prism Error: File '{target_file}' not found.", file=sys.stderr)
+        return 1
+
+    try:
+        with open(target_file, "r", encoding="utf-8-sig") as script_file:
+            file_code = script_file.read()
+    except (OSError, UnicodeError) as error:
+        print(f"Prism Error: Could not read '{target_file}': {error}", file=sys.stderr)
+        return 1
+
+    cli_interpreter = PrismInterpreter(
+        root_tk=None,
+        output_callback=print,
+        settings_provider=lambda: {"show_comments": True}
+    )
+    print(f"--- Running Prism Script: {target_file} ---")
+    try:
+        cli_interpreter.run(file_code)
+        print("\n--- Execution Finished Successfully ---")
+        if cli_interpreter.windows and cli_interpreter.root_tk is not None:
+            cli_interpreter.root_tk.mainloop()
+        return 0
+    except Exception as error:
+        print(f"\n[Runtime Error]: {error}", file=sys.stderr)
+        return 1
+
+
 if __name__ == "__main__":
-    # Check if a .prism file was passed via command line arguments (CLI Mode)
-    if len(sys.argv) > 1:
-        target_file = sys.argv[1]
-        if os.path.exists(target_file):
-            with open(target_file, "r", encoding="utf-8") as f:
-                file_code = f.read()
-            
-            # Initialize CLI Interpreter with standard print output
-            cli_interpreter = PrismInterpreter(
-                root_tk=None,
-                output_callback=print,
-                settings_provider=lambda: {"show_comments": True}
-            )
-            
-            print(f"--- Running Prism Script: {target_file} ---")
-            try:
-                cli_interpreter.run(file_code)
-                print("\n--- Execution Finished Successfully ---")
-            except Exception as err:
-                print(f"\n[Runtime Error]: {err}")
-        else:
-            print(f"Prism Error: File '{target_file}' not found.")
-        sys.exit(0)
-    
-    # Otherwise, launch the Graphical IDE (GUI Mode)
+    cli_exit_code = run_cli(sys.argv[1:])
+    if cli_exit_code is not None:
+        sys.exit(cli_exit_code)
+
     root = tk.Tk()
     app = PrismIDE(root)
     root.mainloop()
