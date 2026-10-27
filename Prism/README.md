@@ -11,7 +11,7 @@ prism script.prism
 ```
 
 The `Prism.exe` launcher runs the interpreter. If the executable is not
-available, `prism.bat` falls back to `..\SOURCECODE\prism_ide.py` and requires
+available, `prism.bat` falls back to `..\prism_ide.py` and requires
 Python 3 with Tkinter. If you haven't set up PATH, run `prism.bat
 script.prism` while in this folder.
 
@@ -30,7 +30,7 @@ when using the packaged executable.
 From the project root, with Python and PyInstaller installed, run:
 
 ```bat
-python -m PyInstaller --noconfirm --clean --onefile --name Prism --add-data "SOURCECODE\libraries;libraries" --distpath Prism SOURCECODE\prism_ide.py
+python -m PyInstaller --noconfirm --clean --onefile --name Prism --add-data "Prism\libraries;libraries" --distpath Prism prism_ide.py
 ```
 
 In a script, load an installed library with `library.use;[WC]` or
