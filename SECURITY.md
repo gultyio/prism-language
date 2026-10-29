@@ -8,7 +8,7 @@ Security isn't added yet...
 | ------- | ------------------ |
 | 1.9.0.x   | :white_check_mark: |
 | 1.1.0.x   | :x:                |
-| 1.0.1.7.x   | :white_check_mark: |
+| 1.0.1.7.x   | :x: |
 | < 1.0.0   | :x:                |
 
 ## Reporting a Vulnerability
