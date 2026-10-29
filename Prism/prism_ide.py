@@ -51,6 +51,10 @@ class PrismInterpreter:
         self.windows = {} # Stores active GUI windows & canvases
         self.persistent_store = {} # Simulates database store
         self.loaded_libraries = set()
+        self.logic_gate_results = {}
+        self.logic_gate_inputs = {}
+        self.latest_logic_gate_results = {}
+        self.next_logic_gate_id = 1
 
     def log(self, text):
         self.output_callback(text + "\n")
@@ -89,6 +93,10 @@ class PrismInterpreter:
         self.key_functions.clear()
         self.persistent_store.clear()
         self.loaded_libraries.clear()
+        self.logic_gate_results.clear()
+        self.logic_gate_inputs.clear()
+        self.latest_logic_gate_results.clear()
+        self.next_logic_gate_id = 1
         
         # Close any lingering windows from previous runs
         for w_data in self.windows.values():
@@ -100,6 +108,141 @@ class PrismInterpreter:
 
         lines = code.split('\n')
         self.execute_block(lines)
+
+    def resolve_logic_gate_value(self, token):
+        token = token.strip()
+        if token.startswith("[") and token.endswith("]"):
+            variable_name = token[1:-1]
+            if variable_name not in self.variables:
+                raise ValueError(f"Logic gate input variable '{variable_name}' is undefined.")
+            value = self.variables[variable_name]
+        else:
+            value = token.strip('"\'')
+
+        if isinstance(value, bool):
+            return int(value)
+        if isinstance(value, (int, float)) and value in (0, 1):
+            return int(value)
+        if isinstance(value, str) and value.strip() in ("0", "1"):
+            return int(value.strip())
+        raise ValueError(f"Logic gate inputs must resolve to 0 or 1, got '{value}'.")
+
+    def apply_logic_gate(self, gate, left, right, result_id=None):
+        gate = gate.upper()
+        left_value = self.resolve_logic_gate_value(left)
+        right_value = self.resolve_logic_gate_value(right)
+        operations = {
+            "AND": left_value & right_value,
+            "OR": left_value | right_value,
+            "XOR": left_value ^ right_value,
+            "NAND": 1 - (left_value & right_value),
+            "NOR": 1 - (left_value | right_value),
+            "XNOR": 1 - (left_value ^ right_value),
+        }
+        if gate not in operations:
+            supported = ", ".join(operations)
+            raise ValueError(f"Unknown logic gate '{gate}'. Supported gates: {supported}.")
+
+        result = operations[gate]
+        if result_id is None:
+            result_id = f"auto_{self.next_logic_gate_id}"
+            self.next_logic_gate_id += 1
+        else:
+            result_id = result_id.strip().strip('"\'')
+            if not result_id:
+                raise ValueError("Logic gate ID cannot be empty.")
+
+        self.logic_gate_results[(gate, result_id)] = result
+        self.logic_gate_inputs[(gate, result_id)] = (left_value, right_value)
+        self.latest_logic_gate_results[gate] = (result_id, result)
+        store_key = f"logicgate:{gate}:{result_id}"
+        self.persistent_store[store_key] = {
+            "type": "logic_gate",
+            "gate": gate,
+            "id": result_id,
+            "result": result,
+        }
+        self.log(f"Result({result})")
+        self.log_logic_gate_visual(gate, result_id)
+        return result
+
+    def log_logic_gate_visual(self, gate, result_id, target=None):
+        left_value, right_value = self.logic_gate_inputs[(gate, result_id)]
+        self.log(f"+-- LOGIC GATE {gate} [ID: {result_id}]")
+        self.log(f"A [{left_value}] ----\\")
+        self.log(f"             +--[{gate}]---> Result [{self.logic_gate_results[(gate, result_id)]}]")
+        self.log(f"B [{right_value}] ----/")
+        if target is not None:
+            self.log(f"Result [{self.logic_gate_results[(gate, result_id)]}] -----> {target}")
+        self.log("+------------------------------")
+
+    def connect_logic_gate(self, gate, target, result_id=None):
+        gate = gate.upper()
+        target = target.strip().strip('"\'')
+        if result_id is None:
+            saved_result = self.latest_logic_gate_results.get(gate)
+            if saved_result is None:
+                raise ValueError(f"No {gate} result is available to connect.")
+            result_id, result = saved_result
+        else:
+            result_id = result_id.strip().strip('"\'')
+            if not result_id:
+                raise ValueError("Logic gate ID cannot be empty.")
+            try:
+                result = self.logic_gate_results[(gate, result_id)]
+            except KeyError as error:
+                raise ValueError(f"No {gate} result with ID '{result_id}' was found.") from error
+
+        if target in self.variables:
+            self.variables[target] = result
+            self.log(f"Connected {gate} result {result} to variable '{target}'.")
+            self.log_logic_gate_visual(gate, result_id, f"VARIABLE [{target}]")
+            return
+
+        if target in self.functions:
+            self.variables["logic_gate_result"] = result
+            self.log(f"Connected {gate} result {result} to function '{target}'.")
+            self.log_logic_gate_visual(gate, result_id, f"FUNCTION [{target}]")
+            self.execute_block(self.functions[target])
+            return
+
+        if target in self.classes:
+            self.variables["logic_gate_result"] = result
+            self.log(f"Connected {gate} result {result} to class '{target}'.")
+            self.log_logic_gate_visual(gate, result_id, f"CLASS [{target}]")
+            self.execute_block(self.classes[target])
+            return
+
+        stored_item = self.persistent_store.get(target)
+        if isinstance(stored_item, dict) and stored_item.get("type") == "function":
+            self.variables["logic_gate_result"] = result
+            self.log(f"Connected {gate} result {result} to function '{target}'.")
+            self.log_logic_gate_visual(gate, result_id, f"FUNCTION [{target}]")
+            self.execute_block(stored_item.get("lines", []))
+            return
+        if isinstance(stored_item, dict) and stored_item.get("type") == "class":
+            self.variables["logic_gate_result"] = result
+            self.log(f"Connected {gate} result {result} to class '{target}'.")
+            self.log_logic_gate_visual(gate, result_id, f"CLASS [{target}]")
+            self.execute_block(stored_item.get("lines", []))
+            return
+        if target in self.windows:
+            canvas = self.windows[target]["canvas"]
+            canvas.create_text(
+                10,
+                10,
+                text=f"{gate} Result({result}) [ID: {result_id}]",
+                anchor=tk.NW,
+                fill="#212529",
+                font=("Segoe UI", 10),
+            )
+            self.log(f"Connected {gate} result {result} to window '{target}'.")
+            self.log_logic_gate_visual(gate, result_id, f"WINDOW [{target}]")
+            return
+
+        raise ValueError(
+            f"Logic gate target '{target}' is not a defined variable, function, class, or window."
+        )
 
     def execute_block(self, lines):
         i = 0
@@ -118,6 +261,35 @@ class PrismInterpreter:
                         self.log(f"[Comment]: {cmt_text}")
                 i += 1
                 continue
+
+            # Logic gate evaluation and output connections.
+            elif line.lower().startswith("apply.logicgates."):
+                match = re.fullmatch(
+                    r'apply\.logicgates\.([a-z]+);\s*\((.*?)\);\s*\((.*?)\)'
+                    r'(?:\s*;\s*\(\s*ID:\s*(.*?)\s*\))?\s*[:;]?',
+                    line,
+                    re.IGNORECASE,
+                )
+                if not match:
+                    raise ValueError(
+                        "Invalid logic gate syntax. Use "
+                        "apply.logicgates.XOR;(value1);(value2) or add ;(ID: name)."
+                    )
+                self.apply_logic_gate(match.group(1), match.group(2), match.group(3), match.group(4))
+
+            elif line.lower().startswith("connect.logicgate."):
+                match = re.fullmatch(
+                    r'connect\.logicgate\.([a-z]+);\s*\((.*?)\)'
+                    r'(?:\s*;\s*\(\s*ID:\s*(.*?)\s*\))?\s*[:;]?',
+                    line,
+                    re.IGNORECASE,
+                )
+                if not match:
+                    raise ValueError(
+                        "Invalid logic gate connection syntax. Use "
+                        "connect.logicgate.XOR;(target) or add ;(ID: name)."
+                    )
+                self.connect_logic_gate(match.group(1), match.group(2), match.group(3))
 
             # 2. Installed prebuilt libraries: library.use;[WC|Bitwin]
             elif line.lower().startswith("library.use;"):
@@ -194,7 +366,10 @@ class PrismInterpreter:
 
             # 3. Class Definition: c.create.new.type((class); ("class_name")); {
             elif line.startswith("c.create.new.type("):
-                match = re.search(r'c\.create\.new\.type\(\(class\);\s*\([\"\']?(.*?)[\"\']?\);\s*\{?', line)
+                match = re.search(
+                    r'c\.create\.new\.type\(\(class\);\s*\(\s*["\']?([^"\']+?)["\']?\s*\)\s*\)\s*;\s*\{?',
+                    line
+                )
                 if match:
                     class_name = match.group(1).strip()
                     class_lines = []
@@ -883,11 +1058,21 @@ class PrismInterpreter:
             )
 
     def draw_wolfenstein_map(self, pattern, cols, rows):
-        # Simple Wolfenstein-style raycast renderer (top-down map + vertical slice view)
+        # Render the top-down layout alongside a first-person raycast view.
         w_name = "3D_Viewport"
         w_data = self.ensure_3d_viewport()
         canvas = w_data["canvas"]
-        # Clear previous raycast_objects for cleanliness
+        canvas.update_idletasks()
+        for tag in (
+            "wolf_map_cell",
+            "wolf_map_grid",
+            "wolf_proj",
+            "wolf_ray",
+            "wolf_player",
+            "wolf_panel",
+            "wolf_label",
+        ):
+            canvas.delete(tag)
         w_data["raycast_objects"] = {}
         # Build map array repeating pattern to fill cols*rows
         total = cols * rows
@@ -909,11 +1094,32 @@ class PrismInterpreter:
             return "cube"
 
         # Canvas geometry
-        width = int(canvas.winfo_width() or 900)
-        height = int(canvas.winfo_height() or 700)
-        # Partition canvas: left 40% = top-down map, right 60% = vertical projection
+        canvas_width = canvas.winfo_width()
+        canvas_height = canvas.winfo_height()
+        width = canvas_width if canvas_width > 1 else 900
+        height = canvas_height if canvas_height > 1 else 700
+        # Partition the viewport into a top-down map and a larger first-person view.
         left_w = int(width * 0.4)
         right_x = left_w + 8
+        projection_width = max(1, width - right_x)
+        canvas.create_rectangle(
+            right_x,
+            0,
+            width,
+            height / 2,
+            fill="#84b8dc",
+            outline="",
+            tags=("wolf_panel", "wolf_proj"),
+        )
+        canvas.create_rectangle(
+            right_x,
+            height / 2,
+            width,
+            height,
+            fill="#31343b",
+            outline="",
+            tags=("wolf_panel", "wolf_proj"),
+        )
         # Draw top-down map
         cell_w = max(6, left_w // max(1, cols))
         cell_h = max(6, height // max(1, rows))
@@ -931,32 +1137,63 @@ class PrismInterpreter:
                     canvas.create_rectangle(x, y, x + cell_w - 1, y + cell_h - 1, fill=fill, outline="#222222", tags=("wolf_map_cell",))
                 else:
                     canvas.create_rectangle(x, y, x + cell_w - 1, y + cell_h - 1, fill="#111111", outline="#1a1a1a", tags=("wolf_map_cell",))
-        # Player starting position at center
-        player_x = cols / 2.0
-        player_y = rows / 2.0
+        # Put the player on a walkable tile so every ray does not start in a wall.
+        open_cells = [
+            (column, row)
+            for row in range(rows)
+            for column in range(cols)
+            if not char_to_wall(grid[row][column])
+        ]
+        if not open_cells:
+            raise ValueError("Wolfenstein map has no walkable tiles (use 0 or space for floor).")
+        center_x, center_y = cols / 2.0, rows / 2.0
+        player_cell_x, player_cell_y = min(
+            open_cells,
+            key=lambda cell: (cell[0] + 0.5 - center_x) ** 2 + (cell[1] + 0.5 - center_y) ** 2,
+        )
+        player_x = player_cell_x + 0.5
+        player_y = player_cell_y + 0.5
         player_angle = 0.0
+        for dx, dy, angle in ((1, 0, 0.0), (0, -1, -1.5708), (-1, 0, 3.14159), (0, 1, 1.5708)):
+            facing_x, facing_y = player_cell_x + dx, player_cell_y + dy
+            if (
+                0 <= facing_x < cols
+                and 0 <= facing_y < rows
+                and not char_to_wall(grid[facing_y][facing_x])
+            ):
+                player_angle = angle
+                break
         # Draw player on map
         px = map_origin_x + player_x * cell_w
         py = map_origin_y + player_y * cell_h
-        canvas.create_oval(px - 4, py - 4, px + 4, py + 4, fill="#ffffff", tags=("wolf_player",))
+        canvas.create_oval(
+            px - 4, py - 4, px + 4, py + 4,
+            fill="#ffffff", outline="#111111", tags=("wolf_player",)
+        )
+        canvas.create_line(
+            px,
+            py,
+            px + __import__('math').cos(player_angle) * 12,
+            py + __import__('math').sin(player_angle) * 12,
+            fill="#ffffff",
+            width=2,
+            tags=("wolf_player",),
+        )
 
         # Vertical projection
-        slice_width = max(2, (width - right_x) // 180)
-        num_slices = (width - right_x) // slice_width
+        num_slices = min(240, projection_width)
         fov = 60.0 * (3.14159 / 180.0)
         half_fov = fov / 2.0
         max_view_distance = max(cols, rows) * 1.5
         proj_origin_x = right_x
-        proj_origin_y = 0
         proj_height = height
 
-        # raycast for each slice
+        # March each camera ray through the map and project wall hits by distance.
         for i in range(num_slices):
             ray_angle = player_angle - half_fov + (i / max(1, num_slices - 1)) * fov
-            # step along ray
             distance = 0.0
             hit = None
-            step = 0.1
+            step = 0.05
             while distance < max_view_distance:
                 test_x = player_x + distance * (math_cos := __import__('math').cos(ray_angle))
                 test_y = player_y + distance * (math_sin := __import__('math').sin(ray_angle))
@@ -971,17 +1208,65 @@ class PrismInterpreter:
             if hit:
                 # simple fisheye correction
                 corrected = distance * __import__('math').cos(ray_angle - player_angle)
-                wall_height = int(min(proj_height, (proj_height * 1.5) / max(0.001, corrected)))
-                shade = int(max(40, 255 - min(200, corrected * 18)))
-                color = f"#{shade:02x}{shade:02x}{shade:02x}"
-                x = proj_origin_x + i * slice_width
+                wall_height = min(proj_height, (proj_height * 0.8) / max(0.05, corrected))
+                wall_type = char_to_wall(grid[hit[1]][hit[0]])
+                base_color = {
+                    "cube": (123, 60, 255),
+                    "sphere": (255, 140, 0),
+                    "cylinder": (25, 135, 84),
+                    "pyramid": (214, 51, 132),
+                }[wall_type]
+                shade = max(0.2, 1.0 - corrected / max_view_distance)
+                red, green, blue = (int(channel * shade) for channel in base_color)
+                color = f"#{red:02x}{green:02x}{blue:02x}"
+                x = proj_origin_x + i * projection_width / num_slices
+                slice_width = projection_width / num_slices + 1
                 y1 = (proj_height - wall_height) // 2
                 y2 = y1 + wall_height
-                canvas.create_rectangle(x, y1, x + slice_width, y2, fill=color, outline=color, tags=("wolf_proj",))
+                canvas.create_rectangle(
+                    x,
+                    y1,
+                    x + slice_width,
+                    y2,
+                    fill=color,
+                    outline=color,
+                    tags=("wolf_proj",),
+                )
                 # draw ray on map
-                canvas.create_line(px, py, map_origin_x + (hit[0] + 0.5) * cell_w, map_origin_y + (hit[1] + 0.5) * cell_h, fill="#ffff66", width=1, tags=("wolf_ray",))
+                canvas.create_line(
+                    px,
+                    py,
+                    map_origin_x + (hit[0] + 0.5) * cell_w,
+                    map_origin_y + (hit[1] + 0.5) * cell_h,
+                    fill="#ffff66",
+                    width=1,
+                    tags=("wolf_ray",),
+                )
+        canvas.create_line(
+            left_w + 4, 0, left_w + 4, height,
+            fill="#ffffff", width=2, tags=("wolf_panel",)
+        )
+        canvas.create_text(
+            left_w / 2,
+            12,
+            text="TOP-DOWN MAP",
+            fill="#ffffff",
+            font=("Segoe UI", 9, "bold"),
+            tags=("wolf_label",),
+        )
+        canvas.create_text(
+            right_x + projection_width / 2,
+            12,
+            text="3D RAYCAST VIEW",
+            fill="#111827",
+            font=("Segoe UI", 10, "bold"),
+            tags=("wolf_label",),
+        )
         self.persistent_store[f"wolf_map_{len(self.persistent_store)}"] = {"type": "wolfenstein_map", "cols": cols, "rows": rows}
-        self.log(f"Wolfenstein raycast map rendered ({cols}x{rows}) from pattern: '{pattern[:64]}'")
+        self.log(
+            f"Wolfenstein map rendered with top-down and 3D raycast views "
+            f"({cols}x{rows}); player starts at ({player_cell_x + 1}, {player_cell_y + 1})."
+        )
 
     def handle_3d_raycast(self, event):
         w_data = self.windows.get("3D_Viewport")
@@ -1129,6 +1414,7 @@ class PrismIDE:
         self.menu.add_command(label="9. Custom Classes & find.store run", command=lambda: self.load_example("classes"))
         self.menu.add_command(label="10. 3D Raycast Grid", command=lambda: self.load_example("raycast_grid"))
         self.menu.add_command(label="11. Wolfenstein Raycast Map", command=lambda: self.load_example("wolfenstein_map"))
+        self.menu.add_command(label="12. Logic Gates & Connections", command=lambda: self.load_example("logic_gates"))
         
         self.examples_btn.pack(side=tk.LEFT, padx=5)
 
@@ -1480,6 +1766,32 @@ store.[PlayerEntity]
 
 c.comment("Execute the stored class via find.store")
 find.store.[PlayerEntity]; run
+''',
+            "logic_gates": '''c.comment("Example 12: Logic Gates, IDs, and Connections")
+
+h.func.define;[left_input]
+h.change;variable:[left_input];[1]
+h.func.define;[right_input]
+h.change;variable:[right_input];[0]
+h.func.define;[gate_output]
+
+c.comment("Apply XOR, save its result with an ID, and connect it to a variable.")
+apply.logicgates.XOR; ([left_input]); ([right_input]); (ID: demo_xor)
+connect.logicgate.XOR; (gate_output); (ID: demo_xor)
+h.printline;"Variable received the XOR result:"
+h.printline;[gate_output]
+
+c.comment("Functions and classes receive the result in [logic_gate_result].")
+h.func.definefunc;(show_gate_result);
+     h.printline;"Function received logic_gate_result:"
+     h.printline;[logic_gate_result]
+connect.logicgate.XOR; (show_gate_result); (ID: demo_xor)
+
+c.comment("Without an ID, connect uses the latest result for that gate.")
+apply.logicgates.AND; (1); (1)
+connect.logicgate.AND; (gate_output)
+h.printline;"Latest AND result:"
+h.printline;[gate_output]
 '''
         }
         
@@ -1559,8 +1871,36 @@ find.store.[PlayerEntity]; run
    Syntax: 3D.raycast.wolfensteinformula.shapes; (pattern); (columns x rows);
    Example: 3D.raycast.wolfensteinformula.shapes; (101100); (16x16);
    The pattern is repeated to fill the grid (cols*rows). Characters '1' (or c/w)
-   represent walls; '0' (or space) are empty. This renders a simple top-down
-   map and a basic vertical projection using Wolfenstein-style raycasting.
+   represent walls; '0' (or space) are empty. The viewport shows the top-down
+   tile map beside a first-person 3D raycast view with perspective wall slices.
+   The player is placed on a nearby walkable tile automatically.
+
+9. LOGIC GATES & CONNECTIONS:
+   Supported two-input gates: AND, OR, XOR, NAND, NOR, XNOR.
+   Inputs must resolve to 0 or 1; use literals or [variables].
+   Applying a gate prints Result(0) or Result(1) and a visual wiring diagram.
+   An optional ID saves a result for a later connection. Without an ID,
+   connect uses the latest result for that gate.
+
+   Example - save and connect an XOR result to a variable:
+   h.func.define;[left]
+   h.change;variable:[left];[1]
+   h.func.define;[right]
+   h.change;variable:[right];[0]
+   h.func.define;[output]
+   apply.logicgates.XOR; ([left]); ([right]); (ID: player_hit)
+   connect.logicgate.XOR; (output); (ID: player_hit)
+   h.printline;[output]
+
+   Connection targets:
+   connect.logicgate.XOR; (my_variable); (ID: player_hit)
+   connect.logicgate.XOR; (my_function); (ID: player_hit)
+   connect.logicgate.XOR; (my_class); (ID: player_hit)
+   connect.logicgate.XOR; (MyWindow); (ID: player_hit)
+   Omit "; (ID: player_hit)" to use the latest result.
+   Variable targets receive the value. Functions/classes run with
+   [logic_gate_result] set. Windows display the result on their canvas.
+   The visual console shows both input wires, gate, output, ID, and connection.
 """
         help_text.insert(tk.END, guide_content)
         help_text.config(state=tk.DISABLED)
