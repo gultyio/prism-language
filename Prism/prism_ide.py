@@ -3,8 +3,17 @@ from tkinter import scrolledtext, messagebox, Menu, filedialog, simpledialog
 import re
 import os
 import sys
+import math
 
-PREBUILT_LIBRARY_NAMES = {"wc": "WC", "bitwin": "Bitwin"}
+PREBUILT_LIBRARY_NAMES = {
+    "wc": "WC",
+    "wc+": "WC+",
+    "wcplus": "WC+",
+    "bitwin": "Bitwin",
+    "iaf": "IAF",
+    "c-s": "C-S",
+    "cs": "C-S",
+}
 
 
 def get_library_directory():
@@ -15,9 +24,8 @@ def get_library_directory():
 def install_library(name):
     canonical_name = PREBUILT_LIBRARY_NAMES.get(name.lower())
     if canonical_name is None:
-        raise ValueError(
-            f"Unknown library '{name}'. Available libraries: WC, Bitwin."
-        )
+        available = ", ".join(sorted(set(PREBUILT_LIBRARY_NAMES.values())))
+        raise ValueError(f"Unknown library '{name}'. Available libraries: {available}.")
 
     bundle_directory = getattr(
         sys,
@@ -46,6 +54,7 @@ class PrismInterpreter:
         self.settings_provider = settings_provider # Access IDE settings (e.g. show_comments)
         self.variables = {}
         self.functions = {}
+        self.function_parameters = {}
         self.classes = {} # Stores user-defined classes
         self.key_functions = {}
         self.windows = {} # Stores active GUI windows & canvases
@@ -55,6 +64,7 @@ class PrismInterpreter:
         self.logic_gate_inputs = {}
         self.latest_logic_gate_results = {}
         self.next_logic_gate_id = 1
+        self.logic_gate_visual_canvas = None
 
     def log(self, text):
         self.output_callback(text + "\n")
@@ -89,6 +99,7 @@ class PrismInterpreter:
     def run(self, code):
         self.variables.clear()
         self.functions.clear()
+        self.function_parameters.clear()
         self.classes.clear()
         self.key_functions.clear()
         self.persistent_store.clear()
@@ -127,6 +138,44 @@ class PrismInterpreter:
             return int(value.strip())
         raise ValueError(f"Logic gate inputs must resolve to 0 or 1, got '{value}'.")
 
+    def resolve_function_argument(self, token):
+        token = token.strip()
+        if token.startswith("[") and token.endswith("]"):
+            variable_name = token[1:-1]
+            if variable_name not in self.variables:
+                raise ValueError(f"Function argument variable '{variable_name}' is undefined.")
+            return self.variables[variable_name]
+        if token.startswith('"') and token.endswith('"'):
+            return token[1:-1]
+        if token.startswith("'") and token.endswith("'"):
+            return token[1:-1]
+        return self.get_val(token)
+
+    def call_function(self, function_name, arguments):
+        if function_name not in self.functions:
+            raise ValueError(f"Function '{function_name}' was not found.")
+        parameters = self.function_parameters.get(function_name, [])
+        if len(arguments) != len(parameters):
+            raise ValueError(
+                f"Function '{function_name}' expects {len(parameters)} argument(s), "
+                f"received {len(arguments)}."
+            )
+
+        previous_values = {
+            parameter: (parameter in self.variables, self.variables.get(parameter))
+            for parameter in parameters
+        }
+        try:
+            for parameter, value in zip(parameters, arguments):
+                self.variables[parameter] = value
+            self.execute_block(self.functions[function_name])
+        finally:
+            for parameter, (was_defined, previous_value) in previous_values.items():
+                if was_defined:
+                    self.variables[parameter] = previous_value
+                else:
+                    self.variables.pop(parameter, None)
+
     def apply_logic_gate(self, gate, left, right, result_id=None):
         gate = gate.upper()
         left_value = self.resolve_logic_gate_value(left)
@@ -163,18 +212,214 @@ class PrismInterpreter:
             "result": result,
         }
         self.log(f"Result({result})")
-        self.log_logic_gate_visual(gate, result_id)
+        self.update_logic_gate_visual(gate, result_id)
         return result
 
-    def log_logic_gate_visual(self, gate, result_id, target=None):
+    def update_logic_gate_visual(self, gate, result_id, target=None):
         left_value, right_value = self.logic_gate_inputs[(gate, result_id)]
-        self.log(f"+-- LOGIC GATE {gate} [ID: {result_id}]")
-        self.log(f"A [{left_value}] ----\\")
-        self.log(f"             +--[{gate}]---> Result [{self.logic_gate_results[(gate, result_id)]}]")
-        self.log(f"B [{right_value}] ----/")
+        result = self.logic_gate_results[(gate, result_id)]
+
+        visual_data = self.windows.get("Logic_Gate_Visualizer")
+        try:
+            visual_exists = visual_data is not None and visual_data["window"].winfo_exists()
+        except tk.TclError:
+            visual_exists = False
+        if not visual_exists:
+            root = self.get_root_tk()
+            window = self.create_toplevel(root)
+            window.title("Prism Logic Gate Visualizer")
+            window.geometry("760x380")
+            window.minsize(620, 340)
+            canvas = tk.Canvas(
+                window,
+                background="#171923",
+                highlightthickness=0,
+            )
+            canvas.pack(fill=tk.BOTH, expand=True)
+            visual_data = {"window": window, "canvas": canvas, "shapes": {}, "coords": {}}
+            self.windows["Logic_Gate_Visualizer"] = visual_data
+            self.logic_gate_visual_canvas = canvas
+        else:
+            canvas = visual_data["canvas"]
+
+        canvas.delete("all")
+        canvas.update_idletasks()
+        width = max(canvas.winfo_width(), 620)
+        height = max(canvas.winfo_height(), 340)
+        gate_color = "#60a5fa"
+        high_color = "#34d399"
+        low_color = "#64748b"
+        left_color = high_color if left_value else low_color
+        right_color = high_color if right_value else low_color
+        result_color = high_color if result else low_color
+        center_y = height / 2
+        gate_left = width * 0.39
+        gate_right = width * 0.61
+        output_x = width * 0.78
+
+        canvas.create_text(
+            24,
+            24,
+            text=f"{gate} LOGIC GATE",
+            anchor=tk.W,
+            fill="#f8fafc",
+            font=("Segoe UI", 15, "bold"),
+        )
+        canvas.create_text(
+            width - 24,
+            27,
+            text=f"ID: {result_id}",
+            anchor=tk.E,
+            fill="#cbd5e1",
+            font=("Segoe UI", 10),
+        )
+
+        input_top_y = center_y - 58
+        input_bottom_y = center_y + 58
+        input_node_x = 74
+        for label, value, color, y in (
+            ("A", left_value, left_color, input_top_y),
+            ("B", right_value, right_color, input_bottom_y),
+        ):
+            canvas.create_text(
+                input_node_x - 25,
+                y,
+                text=label,
+                fill="#e2e8f0",
+                font=("Segoe UI", 12, "bold"),
+            )
+            canvas.create_oval(
+                input_node_x - 14,
+                y - 14,
+                input_node_x + 14,
+                y + 14,
+                fill=color,
+                outline="#f8fafc",
+                width=2,
+            )
+            canvas.create_text(
+                input_node_x,
+                y,
+                text=str(value),
+                fill="#0f172a",
+                font=("Segoe UI", 11, "bold"),
+            )
+            canvas.create_line(
+                input_node_x + 16,
+                y,
+                gate_left - 12,
+                y,
+                fill=color,
+                width=4,
+                arrow=tk.LAST,
+                arrowshape=(10, 12, 4),
+            )
+
+        canvas.create_rectangle(
+            gate_left,
+            center_y - 54,
+            gate_right,
+            center_y + 54,
+            fill="#232b3b",
+            outline=gate_color,
+            width=3,
+        )
+        canvas.create_text(
+            (gate_left + gate_right) / 2,
+            center_y - 8,
+            text=gate,
+            fill="#eff6ff",
+            font=("Segoe UI", 17, "bold"),
+        )
+        canvas.create_text(
+            (gate_left + gate_right) / 2,
+            center_y + 22,
+            text="BOOLEAN",
+            fill="#93a4bd",
+            font=("Segoe UI", 8, "bold"),
+        )
+
+        canvas.create_line(
+            gate_right,
+            center_y,
+            output_x - 20,
+            center_y,
+            fill=result_color,
+            width=5,
+            arrow=tk.LAST,
+            arrowshape=(12, 14, 5),
+        )
+        canvas.create_oval(
+            output_x - 20,
+            center_y - 20,
+            output_x + 20,
+            center_y + 20,
+            fill=result_color,
+            outline="#f8fafc",
+            width=2,
+        )
+        canvas.create_text(
+            output_x,
+            center_y,
+            text=str(result),
+            fill="#0f172a",
+            font=("Segoe UI", 14, "bold"),
+        )
+        canvas.create_text(
+            output_x,
+            center_y + 34,
+            text=f"Result({result})",
+            fill="#f8fafc",
+            font=("Segoe UI", 11, "bold"),
+        )
+
         if target is not None:
-            self.log(f"Result [{self.logic_gate_results[(gate, result_id)]}] -----> {target}")
-        self.log("+------------------------------")
+            target_x = width - 24
+            target_left = target_x - 185
+            target_y = height - 54
+            canvas.create_line(
+                output_x,
+                center_y + 42,
+                output_x,
+                target_y,
+                target_left - 20,
+                target_y,
+                target_left,
+                target_y,
+                fill=result_color,
+                width=3,
+                arrow=tk.LAST,
+                arrowshape=(10, 12, 4),
+            )
+            canvas.create_rectangle(
+                target_left,
+                target_y - 20,
+                target_x,
+                target_y + 20,
+                fill="#263449",
+                outline=gate_color,
+                width=2,
+            )
+            canvas.create_text(
+                target_left + 92,
+                target_y,
+                text=target,
+                fill="#f8fafc",
+                font=("Segoe UI", 9, "bold"),
+            )
+        else:
+            canvas.create_text(
+                width / 2,
+                height - 24,
+                text="Run connect.logicgate to route this output to a variable, function, class, or window.",
+                fill="#94a3b8",
+                font=("Segoe UI", 9),
+            )
+
+        window = visual_data["window"]
+        window.deiconify()
+        window.lift()
+        self.logic_gate_visual_canvas = canvas
 
     def connect_logic_gate(self, gate, target, result_id=None):
         gate = gate.upper()
@@ -196,20 +441,20 @@ class PrismInterpreter:
         if target in self.variables:
             self.variables[target] = result
             self.log(f"Connected {gate} result {result} to variable '{target}'.")
-            self.log_logic_gate_visual(gate, result_id, f"VARIABLE [{target}]")
+            self.update_logic_gate_visual(gate, result_id, f"VARIABLE [{target}]")
             return
 
         if target in self.functions:
             self.variables["logic_gate_result"] = result
             self.log(f"Connected {gate} result {result} to function '{target}'.")
-            self.log_logic_gate_visual(gate, result_id, f"FUNCTION [{target}]")
+            self.update_logic_gate_visual(gate, result_id, f"FUNCTION [{target}]")
             self.execute_block(self.functions[target])
             return
 
         if target in self.classes:
             self.variables["logic_gate_result"] = result
             self.log(f"Connected {gate} result {result} to class '{target}'.")
-            self.log_logic_gate_visual(gate, result_id, f"CLASS [{target}]")
+            self.update_logic_gate_visual(gate, result_id, f"CLASS [{target}]")
             self.execute_block(self.classes[target])
             return
 
@@ -217,13 +462,13 @@ class PrismInterpreter:
         if isinstance(stored_item, dict) and stored_item.get("type") == "function":
             self.variables["logic_gate_result"] = result
             self.log(f"Connected {gate} result {result} to function '{target}'.")
-            self.log_logic_gate_visual(gate, result_id, f"FUNCTION [{target}]")
+            self.update_logic_gate_visual(gate, result_id, f"FUNCTION [{target}]")
             self.execute_block(stored_item.get("lines", []))
             return
         if isinstance(stored_item, dict) and stored_item.get("type") == "class":
             self.variables["logic_gate_result"] = result
             self.log(f"Connected {gate} result {result} to class '{target}'.")
-            self.log_logic_gate_visual(gate, result_id, f"CLASS [{target}]")
+            self.update_logic_gate_visual(gate, result_id, f"CLASS [{target}]")
             self.execute_block(stored_item.get("lines", []))
             return
         if target in self.windows:
@@ -237,12 +482,160 @@ class PrismInterpreter:
                 font=("Segoe UI", 10),
             )
             self.log(f"Connected {gate} result {result} to window '{target}'.")
-            self.log_logic_gate_visual(gate, result_id, f"WINDOW [{target}]")
+            self.update_logic_gate_visual(gate, result_id, f"WINDOW [{target}]")
             return
 
         raise ValueError(
             f"Logic gate target '{target}' is not a defined variable, function, class, or window."
         )
+
+    def get_store_search_items(self):
+        items = []
+        for name, value in self.variables.items():
+            if name in {"store_choice", "store_choice_type", "selected_store"}:
+                continue
+            items.append({"type": "variable", "name": name, "value": value})
+        for name, lines in self.functions.items():
+            items.append({
+                "type": "function",
+                "name": name,
+                "value": f"{len(lines)} body line(s), {len(self.function_parameters.get(name, []))} parameter(s)",
+            })
+        for name, lines in self.classes.items():
+            items.append({"type": "class", "name": name, "value": f"{len(lines)} body line(s)"})
+        for name, window_data in self.windows.items():
+            if name == "Store_Chooser":
+                continue
+            try:
+                exists = window_data["window"].winfo_exists()
+            except (KeyError, tk.TclError):
+                exists = False
+            if exists:
+                items.append({"type": "window", "name": name, "value": "Open GUI window"})
+        for name, value in self.persistent_store.items():
+            items.append({"type": "stored item", "name": name, "value": value})
+        return sorted(items, key=lambda item: (item["type"], item["name"].lower()))
+
+    def open_store_chooser(self):
+        self.variables["store_choice"] = None
+        self.variables["store_choice_type"] = None
+        self.variables["selected_store"] = None
+        root = self.get_root_tk()
+        chooser = self.create_toplevel(root)
+        chooser.title("C-S - Choose Stored Item")
+        chooser.geometry("560x440")
+        chooser.minsize(420, 320)
+
+        background = "#252526"
+        foreground = "#f3f4f6"
+        chooser.configure(bg=background)
+        tk.Label(
+            chooser,
+            text="Search Prism memory and choose an item",
+            bg=background,
+            fg=foreground,
+            font=("Segoe UI", 12, "bold"),
+        ).pack(anchor=tk.W, padx=14, pady=(14, 8))
+
+        search_var = tk.StringVar(master=chooser)
+        search_entry = tk.Entry(
+            chooser,
+            textvariable=search_var,
+            font=("Segoe UI", 10),
+        )
+        search_entry.pack(fill=tk.X, padx=14, pady=(0, 10))
+        search_entry.insert(0, "")
+
+        list_frame = tk.Frame(chooser, bg=background)
+        list_frame.pack(fill=tk.BOTH, expand=True, padx=14)
+        scrollbar = tk.Scrollbar(list_frame)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        item_list = tk.Listbox(
+            list_frame,
+            exportselection=False,
+            yscrollcommand=scrollbar.set,
+            font=("Consolas", 10),
+            bg="#1e1e1e",
+            fg=foreground,
+            selectbackground="#0d6efd",
+        )
+        item_list.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.configure(command=item_list.yview)
+
+        details_var = tk.StringVar(master=chooser, value="Select an item to inspect it.")
+        tk.Label(
+            chooser,
+            textvariable=details_var,
+            anchor=tk.W,
+            justify=tk.LEFT,
+            bg=background,
+            fg="#cbd5e1",
+            wraplength=520,
+        ).pack(fill=tk.X, padx=14, pady=8)
+
+        items = self.get_store_search_items()
+        filtered_items = []
+
+        def refresh_items(*_):
+            query = search_var.get().strip().casefold()
+            filtered_items[:] = [
+                item for item in items
+                if query in item["name"].casefold() or query in item["type"].casefold()
+            ]
+            item_list.delete(0, tk.END)
+            for item in filtered_items:
+                item_list.insert(tk.END, f"[{item['type']}] {item['name']}")
+            details_var.set(
+                f"{len(filtered_items)} item(s) found."
+                if filtered_items else "No matching items. Try another search."
+            )
+
+        def update_details(_event=None):
+            selection = item_list.curselection()
+            if not selection:
+                return
+            item = filtered_items[selection[0]]
+            details_var.set(f"{item['type']} - {item['name']}: {item['value']}")
+
+        def choose_item(_event=None):
+            selection = item_list.curselection()
+            if not selection:
+                self.log("C-S: Select a stored item before choosing it.")
+                return
+            item = filtered_items[selection[0]]
+            self.variables["store_choice"] = item["name"]
+            self.variables["store_choice_type"] = item["type"]
+            self.variables["selected_store"] = item
+            self.log(f"C-S selected {item['type']} '{item['name']}' into [store_choice].")
+            chooser.destroy()
+            self.windows.pop("Store_Chooser", None)
+
+        def close_chooser():
+            chooser.destroy()
+            self.windows.pop("Store_Chooser", None)
+
+        buttons = tk.Frame(chooser, bg=background)
+        buttons.pack(fill=tk.X, padx=14, pady=(0, 14))
+        tk.Button(buttons, text="Choose Item", command=choose_item).pack(side=tk.RIGHT)
+        tk.Button(buttons, text="Close", command=close_chooser).pack(side=tk.RIGHT, padx=8)
+
+        item_list.bind("<<ListboxSelect>>", update_details)
+        item_list.bind("<Double-Button-1>", choose_item)
+        search_var.trace_add("write", refresh_items)
+        refresh_items()
+        self.windows["Store_Chooser"] = {
+            "window": chooser,
+            "canvas": item_list,
+            "shapes": {},
+            "coords": {},
+        }
+        chooser.transient(root)
+        chooser.protocol("WM_DELETE_WINDOW", close_chooser)
+        chooser.grab_set()
+        chooser.lift()
+        search_entry.focus_set()
+        root.wait_window(chooser)
+        self.windows.pop("Store_Chooser", None)
 
     def execute_block(self, lines):
         i = 0
@@ -291,7 +684,7 @@ class PrismInterpreter:
                     )
                 self.connect_logic_gate(match.group(1), match.group(2), match.group(3))
 
-            # 2. Installed prebuilt libraries: library.use;[WC|Bitwin]
+            # Installed prebuilt libraries are required before library.use.
             elif line.lower().startswith("library.use;"):
                 match = re.fullmatch(r'library\.use;\[(.*?)\]', line, re.IGNORECASE)
                 if not match:
@@ -299,14 +692,20 @@ class PrismInterpreter:
                 requested_name = match.group(1)
                 library_name = PREBUILT_LIBRARY_NAMES.get(requested_name.lower())
                 if library_name is None:
-                    raise ValueError(f"Unknown library '{requested_name}'. Available libraries: WC, Bitwin.")
+                    available = ", ".join(sorted(set(PREBUILT_LIBRARY_NAMES.values())))
+                    raise ValueError(f"Unknown library '{requested_name}'. Available libraries: {available}.")
                 package_path = os.path.join(get_library_directory(), f"{library_name}.prism")
                 if not os.path.isfile(package_path):
                     raise FileNotFoundError(
-                        f"Library '{library_name}' is not installed. Run 'prism install {library_name}' first."
+                        f"Library '{library_name}' is not installed. Run 'pr-install {library_name}' first."
                     )
                 self.loaded_libraries.add(library_name)
                 self.log(f"Library loaded: {library_name}")
+
+            elif re.fullmatch(r'scan\.choose\.store\(\)\s*;?', line, re.IGNORECASE):
+                if "C-S" not in self.loaded_libraries:
+                    raise RuntimeError("C-S is not loaded. Add library.use;[C-S] before opening the store chooser.")
+                self.open_store_chooser()
 
             # Bitwin runs UTF-8 Prism source encoded as hexadecimal.
             elif line.lower().startswith("bitwin.run;"):
@@ -323,6 +722,62 @@ class PrismInterpreter:
                 except UnicodeDecodeError as error:
                     raise ValueError("Bitwin hex must decode to valid UTF-8 Prism source.") from error
                 self.execute_block(decoded_source.splitlines())
+
+            # Window Customization PLUS (WC+) operations.
+            elif line.lower().startswith(("wcplus.window.", "wc+.window.")):
+                if "WC+" not in self.loaded_libraries:
+                    raise RuntimeError("WC+ is not loaded. Add library.use;[WC+] before using it.")
+                match = re.fullmatch(
+                    r'wc(?:plus|\+)\.window\.(opacity|topmost|resizable|minsize);'
+                    r'\s*\((.*?)\);\s*\((.*?)\)(?:;\s*\((.*?)\))?',
+                    line,
+                    re.IGNORECASE,
+                )
+                if not match:
+                    raise ValueError(
+                        "Invalid WC+ syntax. Use wcplus.window.opacity;(Window);(0.8), "
+                        "topmost;(Window);(true), resizable;(Window);(width);(height), "
+                        "or minsize;(Window);(width);(height)."
+                    )
+                operation, window_name, first_value, second_value = match.groups()
+                window_name = window_name.strip().strip('"\'')
+                if window_name not in self.windows:
+                    raise ValueError(f"WC+ window '{window_name}' does not exist.")
+                window = self.windows[window_name]["window"]
+                if operation.lower() == "opacity":
+                    try:
+                        opacity = float(first_value.strip())
+                    except ValueError as error:
+                        raise ValueError("WC+ opacity must be a number from 0.0 to 1.0.") from error
+                    if not 0.0 <= opacity <= 1.0:
+                        raise ValueError("WC+ opacity must be a number from 0.0 to 1.0.")
+                    window.attributes("-alpha", opacity)
+                elif operation.lower() == "topmost":
+                    value = first_value.strip().lower()
+                    if value not in ("true", "false", "1", "0"):
+                        raise ValueError("WC+ topmost must be true, false, 1, or 0.")
+                    window.attributes("-topmost", value in ("true", "1"))
+                elif operation.lower() == "resizable":
+                    if second_value is None:
+                        raise ValueError("WC+ resizable requires horizontal and vertical true/false values.")
+                    values = (first_value.strip().lower(), second_value.strip().lower())
+                    if any(value not in ("true", "false", "1", "0") for value in values):
+                        raise ValueError("WC+ resizable values must be true, false, 1, or 0.")
+                    window.resizable(
+                        values[0] in ("true", "1"),
+                        values[1] in ("true", "1"),
+                    )
+                else:
+                    if second_value is None:
+                        raise ValueError(f"WC+ {operation.lower()} requires width and height.")
+                    try:
+                        width = int(first_value.strip())
+                        height = int(second_value.strip())
+                    except ValueError as error:
+                        raise ValueError(f"WC+ {operation.lower()} dimensions must be positive integers.") from error
+                    if width <= 0 or height <= 0:
+                        raise ValueError(f"WC+ {operation.lower()} dimensions must be positive integers.")
+                    window.minsize(width, height)
 
             # Window Customization (WC) operations.
             elif line.lower().startswith("wc.window."):
@@ -451,6 +906,12 @@ class PrismInterpreter:
                         self.log(content)
                 else:
                     self.log(content)
+
+            # C-S searchable store picker.
+            elif re.fullmatch(r"scan\.choose\.store\(\)\s*;?", line, re.IGNORECASE):
+                if "C-S" not in self.loaded_libraries:
+                    raise RuntimeError("C-S is not loaded. Add library.use;[C-S] before using it.")
+                self.open_store_chooser()
 
             # 7. scan.store
             elif line.startswith("scan.store"):
@@ -704,7 +1165,11 @@ class PrismInterpreter:
                     if match:
                         f_name = match.group(1).strip()
                         if f_name in self.functions:
-                            self.persistent_store[f_name] = {"type": "function", "lines": self.functions[f_name]}
+                            self.persistent_store[f_name] = {
+                                "type": "function",
+                                "lines": self.functions[f_name],
+                                "parameters": self.function_parameters.get(f_name, []),
+                            }
                             self.log(f"Store Action: Successfully persisted function '{f_name}'")
                 elif line.startswith("store."):
                     match = re.search(r'store\.[\(\[]?(.*?)[\)\]]?;?', line)
@@ -826,9 +1291,33 @@ class PrismInterpreter:
 
             # 21. Function Definition: h.func.definefunc;(name);
             elif line.startswith("h.func.definefunc;"):
-                match = re.search(r'h\.func\.definefunc;\((.*?)\);', line)
+                match = re.fullmatch(
+                    r'h\.func\.definefunc;\s*\(([^()]*)\)'
+                    r'(?:;\s*\((.*?)\))?\s*;?',
+                    line,
+                    re.IGNORECASE,
+                )
                 if match:
                     func_name = match.group(1).strip()
+                    parameter_text = match.group(2)
+                    parameters = []
+                    if parameter_text:
+                        if "IAF" not in self.loaded_libraries:
+                            raise RuntimeError(
+                                "Parameterized functions require IAF. Add library.use;[IAF] first."
+                            )
+                        parameters = [
+                            parameter.strip().strip("[]")
+                            for parameter in parameter_text.split(",")
+                        ]
+                        if (
+                            any(not re.fullmatch(r"[A-Za-z_]\w*", parameter) for parameter in parameters)
+                            or len(set(parameters)) != len(parameters)
+                        ):
+                            raise ValueError(
+                                f"Invalid or duplicate parameter in function '{func_name}'. "
+                                "Use unique names separated by commas."
+                            )
                     func_lines = []
                     i += 1
                     while i < len(lines):
@@ -839,7 +1328,28 @@ class PrismInterpreter:
                         else:
                             break
                     self.functions[func_name] = func_lines
+                    self.function_parameters[func_name] = parameters
                     continue
+
+            # IAF function calls pass arguments into locally scoped parameters.
+            elif line.lower().startswith("c.func.call;"):
+                if "IAF" not in self.loaded_libraries:
+                    raise RuntimeError("IAF is not loaded. Add library.use;[IAF] before calling this syntax.")
+                if not re.fullmatch(
+                    r'c\.func\.call;\s*\(.*?\)(?:\s*;\s*\(.*?\))*\s*;?',
+                    line,
+                    re.IGNORECASE,
+                ):
+                    raise ValueError(
+                        "Invalid IAF call syntax. Use c.func.call;(function_name);(argument1);(argument2)."
+                    )
+                arguments = re.findall(r'\((.*?)\)', line)
+                function_name = arguments[0].strip()
+                resolved_arguments = [
+                    self.resolve_function_argument(argument)
+                    for argument in arguments[1:]
+                ]
+                self.call_function(function_name, resolved_arguments)
 
             # 22. Count-Based Loops: loop.func.times(N);
             elif line.startswith("loop.func.times("):
@@ -865,7 +1375,7 @@ class PrismInterpreter:
                 if match:
                     func_name = match.group(1)
                     if func_name in self.functions:
-                        self.execute_block(self.functions[func_name])
+                        self.call_function(func_name, [])
                     else:
                         self.log(f"Error: Function '{func_name}' not found.")
 
@@ -1057,11 +1567,83 @@ class PrismInterpreter:
                 fill="#ffb3d2", width=1, tags=tags
             )
 
-    def draw_wolfenstein_map(self, pattern, cols, rows):
+    @staticmethod
+    def wolfenstein_wall_type(ch):
+        ch = ch.lower()
+        if ch in ("0", " "):
+            return None
+        if ch in ("1", "c", "w"):
+            return "cube"
+        if ch in ("2", "s"):
+            return "sphere"
+        if ch in ("3", "y"):
+            return "cylinder"
+        if ch in ("4", "p"):
+            return "pyramid"
+        return "cube"
+
+    def handle_wolfenstein_key(self, event):
+        w_data = self.windows.get("3D_Viewport")
+        if not w_data:
+            return
+        state = w_data.get("wolfenstein_state")
+        if not state:
+            return
+
+        key = event.keysym.lower()
+        turn_step = 0.15
+        move_step = 0.2
+        if key in ("a", "left"):
+            state["angle"] -= turn_step
+        elif key in ("d", "right"):
+            state["angle"] += turn_step
+        elif key in ("w", "up", "s", "down"):
+            direction = -1 if key in ("s", "down") else 1
+            next_x = state["x"] + math.cos(state["angle"]) * move_step * direction
+            next_y = state["y"] + math.sin(state["angle"]) * move_step * direction
+            if self.wolfenstein_position_is_clear(state, next_x, next_y):
+                state["x"] = next_x
+                state["y"] = next_y
+        else:
+            return
+
+        self.draw_wolfenstein_map(
+            state["pattern"],
+            state["cols"],
+            state["rows"],
+            player_state=state,
+        )
+
+    def wolfenstein_position_is_clear(self, state, x, y):
+        radius = 0.18
+        cols, rows = state["cols"], state["rows"]
+        if x - radius < 0 or y - radius < 0 or x + radius >= cols or y + radius >= rows:
+            return False
+
+        grid = state["grid"]
+        first_col = max(0, int(x - radius))
+        last_col = min(cols - 1, int(x + radius))
+        first_row = max(0, int(y - radius))
+        last_row = min(rows - 1, int(y + radius))
+        for row in range(first_row, last_row + 1):
+            for column in range(first_col, last_col + 1):
+                if not self.wolfenstein_wall_type(grid[row][column]):
+                    continue
+                nearest_x = min(max(x, column), column + 1)
+                nearest_y = min(max(y, row), row + 1)
+                if (x - nearest_x) ** 2 + (y - nearest_y) ** 2 < radius ** 2:
+                    return False
+        return True
+
+    def draw_wolfenstein_map(self, pattern, cols, rows, player_state=None):
         # Render the top-down layout alongside a first-person raycast view.
         w_name = "3D_Viewport"
         w_data = self.ensure_3d_viewport()
         canvas = w_data["canvas"]
+        window = w_data["window"]
+        if not w_data.get("wolfenstein_keys_bound"):
+            window.bind("<KeyPress>", self.handle_wolfenstein_key)
+            w_data["wolfenstein_keys_bound"] = True
         canvas.update_idletasks()
         for tag in (
             "wolf_map_cell",
@@ -1078,20 +1660,7 @@ class PrismInterpreter:
         total = cols * rows
         repeated = (pattern * (total // len(pattern) + 1))[:total]
         grid = [list(repeated[i * cols:(i + 1) * cols]) for i in range(rows)]
-        # Map char -> wall presence/type
-        def char_to_wall(ch):
-            ch = ch.lower()
-            if ch in ("0", " "):
-                return None
-            if ch in ("1", "c", "w"):
-                return "cube"
-            if ch in ("2", "s"):
-                return "sphere"
-            if ch in ("3", "y"):
-                return "cylinder"
-            if ch in ("4", "p"):
-                return "pyramid"
-            return "cube"
+        char_to_wall = self.wolfenstein_wall_type
 
         # Canvas geometry
         canvas_width = canvas.winfo_width()
@@ -1138,31 +1707,45 @@ class PrismInterpreter:
                 else:
                     canvas.create_rectangle(x, y, x + cell_w - 1, y + cell_h - 1, fill="#111111", outline="#1a1a1a", tags=("wolf_map_cell",))
         # Put the player on a walkable tile so every ray does not start in a wall.
-        open_cells = [
-            (column, row)
-            for row in range(rows)
-            for column in range(cols)
-            if not char_to_wall(grid[row][column])
-        ]
-        if not open_cells:
-            raise ValueError("Wolfenstein map has no walkable tiles (use 0 or space for floor).")
-        center_x, center_y = cols / 2.0, rows / 2.0
-        player_cell_x, player_cell_y = min(
-            open_cells,
-            key=lambda cell: (cell[0] + 0.5 - center_x) ** 2 + (cell[1] + 0.5 - center_y) ** 2,
-        )
-        player_x = player_cell_x + 0.5
-        player_y = player_cell_y + 0.5
-        player_angle = 0.0
-        for dx, dy, angle in ((1, 0, 0.0), (0, -1, -1.5708), (-1, 0, 3.14159), (0, 1, 1.5708)):
-            facing_x, facing_y = player_cell_x + dx, player_cell_y + dy
-            if (
-                0 <= facing_x < cols
-                and 0 <= facing_y < rows
-                and not char_to_wall(grid[facing_y][facing_x])
-            ):
-                player_angle = angle
-                break
+        is_new_map = player_state is None
+        if is_new_map:
+            open_cells = [
+                (column, row)
+                for row in range(rows)
+                for column in range(cols)
+                if not char_to_wall(grid[row][column])
+            ]
+            if not open_cells:
+                raise ValueError("Wolfenstein map has no walkable tiles (use 0 or space for floor).")
+            center_x, center_y = cols / 2.0, rows / 2.0
+            player_cell_x, player_cell_y = min(
+                open_cells,
+                key=lambda cell: (cell[0] + 0.5 - center_x) ** 2 + (cell[1] + 0.5 - center_y) ** 2,
+            )
+            player_angle = 0.0
+            for dx, dy, angle in ((1, 0, 0.0), (0, -1, -1.5708), (-1, 0, 3.14159), (0, 1, 1.5708)):
+                facing_x, facing_y = player_cell_x + dx, player_cell_y + dy
+                if (
+                    0 <= facing_x < cols
+                    and 0 <= facing_y < rows
+                    and not char_to_wall(grid[facing_y][facing_x])
+                ):
+                    player_angle = angle
+                    break
+            player_state = {
+                "pattern": pattern,
+                "cols": cols,
+                "rows": rows,
+                "grid": grid,
+                "x": player_cell_x + 0.5,
+                "y": player_cell_y + 0.5,
+                "angle": player_angle,
+            }
+            w_data["wolfenstein_state"] = player_state
+        player_x = player_state["x"]
+        player_y = player_state["y"]
+        player_angle = player_state["angle"]
+        player_cell_x, player_cell_y = int(player_x), int(player_y)
         # Draw player on map
         px = map_origin_x + player_x * cell_w
         py = map_origin_y + player_y * cell_h
@@ -1173,8 +1756,8 @@ class PrismInterpreter:
         canvas.create_line(
             px,
             py,
-            px + __import__('math').cos(player_angle) * 12,
-            py + __import__('math').sin(player_angle) * 12,
+            px + math.cos(player_angle) * 12,
+            py + math.sin(player_angle) * 12,
             fill="#ffffff",
             width=2,
             tags=("wolf_player",),
@@ -1195,8 +1778,8 @@ class PrismInterpreter:
             hit = None
             step = 0.05
             while distance < max_view_distance:
-                test_x = player_x + distance * (math_cos := __import__('math').cos(ray_angle))
-                test_y = player_y + distance * (math_sin := __import__('math').sin(ray_angle))
+                test_x = player_x + distance * math.cos(ray_angle)
+                test_y = player_y + distance * math.sin(ray_angle)
                 gx = int(test_x)
                 gy = int(test_y)
                 if gx < 0 or gx >= cols or gy < 0 or gy >= rows:
@@ -1207,7 +1790,7 @@ class PrismInterpreter:
                 distance += step
             if hit:
                 # simple fisheye correction
-                corrected = distance * __import__('math').cos(ray_angle - player_angle)
+                corrected = distance * math.cos(ray_angle - player_angle)
                 wall_height = min(proj_height, (proj_height * 0.8) / max(0.05, corrected))
                 wall_type = char_to_wall(grid[hit[1]][hit[0]])
                 base_color = {
@@ -1248,25 +1831,36 @@ class PrismInterpreter:
         )
         canvas.create_text(
             left_w / 2,
-            12,
-            text="TOP-DOWN MAP",
+            height - 14,
+            text="TOP-DOWN  |  W/S MOVE  A/D TURN",
             fill="#ffffff",
-            font=("Segoe UI", 9, "bold"),
+            font=("Segoe UI", 8, "bold"),
             tags=("wolf_label",),
         )
         canvas.create_text(
             right_x + projection_width / 2,
-            12,
-            text="3D RAYCAST VIEW",
+            height - 14,
+            text="3D RAYCAST VIEW  |  ARROWS ALSO WORK",
             fill="#111827",
-            font=("Segoe UI", 10, "bold"),
+            font=("Segoe UI", 8, "bold"),
             tags=("wolf_label",),
         )
-        self.persistent_store[f"wolf_map_{len(self.persistent_store)}"] = {"type": "wolfenstein_map", "cols": cols, "rows": rows}
-        self.log(
-            f"Wolfenstein map rendered with top-down and 3D raycast views "
-            f"({cols}x{rows}); player starts at ({player_cell_x + 1}, {player_cell_y + 1})."
-        )
+        canvas.focus_set()
+        window.focus_force()
+        map_records = [
+            key for key, value in self.persistent_store.items()
+            if key.startswith("wolf_map_")
+            and isinstance(value, dict)
+            and value.get("type") == "wolfenstein_map"
+        ]
+        map_key = map_records[-1] if map_records else "wolf_map_0"
+        self.persistent_store[map_key] = {"type": "wolfenstein_map", "cols": cols, "rows": rows}
+        if is_new_map:
+            self.log(
+                f"Wolfenstein map rendered with top-down and 3D raycast views "
+                f"({cols}x{rows}); player at ({player_cell_x + 1}, {player_cell_y + 1}). "
+                "Use W/S to move and A/D or left/right arrows to turn."
+            )
 
     def handle_3d_raycast(self, event):
         w_data = self.windows.get("3D_Viewport")
@@ -1415,6 +2009,7 @@ class PrismIDE:
         self.menu.add_command(label="10. 3D Raycast Grid", command=lambda: self.load_example("raycast_grid"))
         self.menu.add_command(label="11. Wolfenstein Raycast Map", command=lambda: self.load_example("wolfenstein_map"))
         self.menu.add_command(label="12. Logic Gates & Connections", command=lambda: self.load_example("logic_gates"))
+        self.menu.add_command(label="13. WC+, IAF & C-S Libraries", command=lambda: self.load_example("new_libraries"))
         
         self.examples_btn.pack(side=tk.LEFT, padx=5)
 
@@ -1753,6 +2348,7 @@ c.comment("The selected name is stored in [raycast_hit].")
 
 c.comment("This uses a repeating pattern where '1' is a wall and '0' is empty.")
 c.comment("Top-down and a simple vertical projection are rendered in the 3D viewport.")
+c.comment("Focus the viewport: W/S move, A/D or arrow keys turn.")
 ''',
             "classes": '''c.comment("Example 9: Custom Classes & find.store run")
 
@@ -1792,6 +2388,29 @@ apply.logicgates.AND; (1); (1)
 connect.logicgate.AND; (gate_output)
 h.printline;"Latest AND result:"
 h.printline;[gate_output]
+''',
+            "new_libraries": '''c.comment("Install WC+, IAF, and C-S with pr-install before running this example.")
+library.use;[WC+]
+library.use;[IAF]
+library.use;[C-S]
+
+display.h.window.show; (500); (320); (1); (LibraryDemo)
+wcplus.window.opacity;(LibraryDemo);(1.0)
+wcplus.window.topmost;(LibraryDemo);(false)
+wcplus.window.resizable;(LibraryDemo);(true);(true)
+wcplus.window.minsize;(LibraryDemo);(360);(240)
+
+h.func.definefunc;(greet);(name);
+     h.printline;"Hello from IAF:"
+     h.printline;[name]
+c.func.call;(greet);("Prism")
+
+h.func.define;[score]
+h.change;variable:[score];[100]
+store.[score]
+scan.choose.store()
+h.printline;"Selected item:"
+h.printline;[store_choice]
 '''
         }
         
@@ -1809,7 +2428,7 @@ h.printline;[gate_output]
 
         help_win.configure(bg=bg_col)
 
-        label = tk.Label(help_win, text="Master Syntax Reference Sheet (v3.5)", font=("Segoe UI", 12, "bold"), bg=bg_col, fg=fg_col)
+        label = tk.Label(help_win, text="Master Syntax Reference Sheet (v3.6)", font=("Segoe UI", 12, "bold"), bg=bg_col, fg=fg_col)
         label.pack(anchor=tk.W, padx=15, pady=10)
 
         help_text = scrolledtext.ScrolledText(help_win, wrap=tk.WORD, font=("Consolas", 10), bg=txt_bg, fg=fg_col, bd=1, relief=tk.SOLID)
@@ -1821,17 +2440,42 @@ h.printline;[gate_output]
    Run a Prism file from the Prism folder (or with prism on PATH):
    > prism script.prism
    Install a prebuilt library:
-   > prism install WC
-   > prism install Bitwin
+   > pr-install WC
+   > pr-install WC+
+   > pr-install Bitwin
+   > pr-install IAF
+   > pr-install C-S
 
 2. PREBUILT LIBRARIES:
-   Install libraries with "prism install WC" or "prism install Bitwin", then
-   load them in a script with library.use;[WC] or library.use;[Bitwin].
+   Install a library with "pr-install <library>", then load it in a script
+   using library.use;[library-name]. Available libraries: WC, WC+, Bitwin,
+   IAF, and C-S.
 
    WC (Window Customization):
    wc.window.title;(MyWindow);("Custom title")
    wc.window.background;(MyWindow);(#336699)
    wc.window.size;(MyWindow);(800);(600)
+
+   WC+ (Window Customization PLUS):
+   wcplus.window.opacity;(MyWindow);(0.8)
+   wcplus.window.topmost;(MyWindow);(true)
+   wcplus.window.resizable;(MyWindow);(true);(false)
+   wcplus.window.minsize;(MyWindow);(320);(200)
+   Use wc+.window. as an alternate prefix. Opacity is from 0.0 to 1.0.
+
+   IAF (Improved Argument Functions):
+   h.func.definefunc;(greet);(name);
+        h.printline;"Hello"
+        h.printline;[name]
+   c.func.call;(greet);("Ada")
+   Parameters are local to the call and restored afterward. Pass literals
+   or defined variables such as [name]; the number of arguments must match.
+
+   C-S (search and choose a stored item):
+   scan.choose.store()
+   This opens a searchable window of variables, functions, classes, windows,
+   and persistent-store entries. Choose an entry to set [store_choice] to its
+   name, [store_choice_type] to its type, and [selected_store] to its record.
 
    Bitwin runs UTF-8 Prism source encoded as hexadecimal:
    bitwin.run;[682e7072696e746c696e653b2248656c6c6f22]
@@ -1874,11 +2518,14 @@ h.printline;[gate_output]
    represent walls; '0' (or space) are empty. The viewport shows the top-down
    tile map beside a first-person 3D raycast view with perspective wall slices.
    The player is placed on a nearby walkable tile automatically.
+   While the viewport is focused, press W/S or the Up/Down arrows to move,
+   and A/D or the Left/Right arrows to turn. Walls block movement.
 
 9. LOGIC GATES & CONNECTIONS:
    Supported two-input gates: AND, OR, XOR, NAND, NOR, XNOR.
    Inputs must resolve to 0 or 1; use literals or [variables].
-   Applying a gate prints Result(0) or Result(1) and a visual wiring diagram.
+   Applying a gate prints Result(0) or Result(1) and opens a graphical
+   visualizer showing its input nodes, active/inactive wires, gate, and output.
    An optional ID saves a result for a later connection. Without an ID,
    connect uses the latest result for that gate.
 
@@ -1900,7 +2547,7 @@ h.printline;[gate_output]
    Omit "; (ID: player_hit)" to use the latest result.
    Variable targets receive the value. Functions/classes run with
    [logic_gate_result] set. Windows display the result on their canvas.
-   The visual console shows both input wires, gate, output, ID, and connection.
+   The visualizer shows both input wires, gate, output, ID, and connection.
 """
         help_text.insert(tk.END, guide_content)
         help_text.config(state=tk.DISABLED)
@@ -1920,12 +2567,12 @@ def run_cli(arguments):
         return None
 
     if arguments[0] in ("--help", "-h"):
-        print("Usage: prism <script.prism> | pr-install <WC|Bitwin>")
+        print("Usage: prism <script.prism> | pr-install <WC|WC+|Bitwin|IAF|C-S>")
         return 0
 
     if arguments[0].lower() in ("pr-install", "install"):
         if len(arguments) != 2:
-            print("Usage: pr-install <WC|Bitwin>", file=sys.stderr)
+            print("Usage: pr-install <WC|WC+|Bitwin|IAF|C-S>", file=sys.stderr)
             return 2
         try:
             installed_path = install_library(arguments[1])
@@ -1936,7 +2583,7 @@ def run_cli(arguments):
             return 1
 
     if len(arguments) != 1:
-        print("Usage: prism <script.prism> | pr-install <WC|Bitwin>", file=sys.stderr)
+        print("Usage: prism <script.prism> | pr-install <WC|WC+|Bitwin|IAF|C-S>", file=sys.stderr)
         return 2
 
     target_file = arguments[0]

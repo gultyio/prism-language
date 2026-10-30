@@ -2,7 +2,7 @@
 
 ## Run Prism scripts
 
-The Windows launchers are in `..\Prism`. Run `setup-prism-path.bat` there once
+The Windows launchers are in `Prism`. Run `setup-prism-path.bat` there once
 and open a new Command Prompt to make `prism` and `pr-install` available from
 any directory. The packaged `Prism.exe` includes the prebuilt libraries;
 without it, the batch launchers require Python 3 with Tkinter. Then run:
@@ -11,18 +11,21 @@ without it, the batch launchers require Python 3 with Tkinter. Then run:
 prism script.prism
 ```
 
-If `Prism.exe` is missing, `Prism\prism.bat` falls back to this folder's
-`prism_ide.py` and requires Python 3 with Tkinter. You can also run
-`python prism_ide.py script.prism` directly. Run `prism` with no arguments to
-open the graphical IDE.
+If `Prism.exe` is missing, `Prism\prism.bat` runs the adjacent
+`Prism\prism_ide.py` and requires Python 3 with Tkinter. You can also run
+`python Prism\prism_ide.py script.prism` directly. Run `prism` with no
+arguments to open the graphical IDE.
 
 ## Install prebuilt libraries
 
-Install a library from this folder:
+Install a prebuilt library:
 
 ```bat
 pr-install WC
+pr-install WC+
 pr-install Bitwin
+pr-install IAF
+pr-install C-S
 ```
 
 Packages are installed per user under `%APPDATA%\Prism\libraries`. Load an

@@ -1,11 +1,14 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+from pathlib import Path
+
+project_dir = Path(SPECPATH)
 
 a = Analysis(
-    ['prism_ide.py'],
-    pathex=[],
+    [str(project_dir / 'prism_ide.py')],
+    pathex=[str(project_dir)],
     binaries=[],
-    datas=[],
+    datas=[(str(project_dir / 'libraries'), 'libraries')],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},
@@ -22,7 +25,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='PrismLG',
+    name='Prism',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
